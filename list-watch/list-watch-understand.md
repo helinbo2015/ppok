@@ -1,8 +1,8 @@
-### 1. kubernetes组件间消息异步通知需求
-kube-controller-manager创建完pod后，ETCD中新创建的pod如何通知给kube-scheduler。而kube-scheduler调度完pod后(更新node.spec.nodeName)，ETCD中的pod变化又怎么通知给kubelet。这些都涉及到kubernetes组件间的消息通知机制。靠谱的消息通知机制，应该要满足下面几点要求:
+### 1. kubernetes组件间消息(数据)异步通知需求
+kube-controller-manager创建完pod后，ETCD中新创建的pod如何通知给kube-scheduler。而kube-scheduler调度完pod后(更新node.spec.nodeName)，ETCD中的pod变化又怎么通知给kubelet。这些都涉及到kubernetes组件间的消息通知机制。kubernentes系统需要的消息通知机制(或者说数据实时通知机制)，应该满足下面几点要求:
 - 需求1: 实时性(即数据变化时，相关组件越快感知越好)
 - 需求2: 保证消息的顺序性(即消息要按发生先后顺序送达目的组件。很难想象在Pod创建消息前收到该Pod删除消息时组件应该怎么处理)
-- 需求3: 保证消息不丢失或者有可靠的重新获取机制(比如说kubelet和kube-apiserver间网络闪断，需要保证网络恢复后kubelet可以收到网络闪断期间发生的消息)
+- 需求3: 保证消息不丢失或者有可靠的重新获取机制(比如说kubelet和kube-apiserver间网络闪断，需要保证网络恢复后kubelet可以收到网络闪断期间产生的消息)
 
 ### 2. kubernetes的解决方案
 
@@ -67,20 +67,23 @@ type ObjectMeta struct {
 
 kubernetes中的list-watch流程如下:  
 
+具体代码参见： kubernetes/vendor/k8s.io/client-go/tools/cache/reflector.go#ListAndWatch()
+
 ![list-watch-workflow](list_watch_workflow.png)
 
-*综合上面的方案分析，我们可以综合总结一下解决方案: kubernetes中基于ResourceVersion信息采用list-watch(http streaming)机制来保证组件间的数据实时可靠传送。从今往后，我们就统称该方案为list-watch机制*
+> watch处理中的ResourceVersion更新是在watchHandler()中实现的。
+
+综合上面的方案分析，我们可以综合总结一下解决方案: kubernetes中基于ResourceVersion信息采用list-watch(http streaming)机制来保证组件间的数据实时可靠传送。从今往后，我们就统称该方案为list-watch机制*
 
 ### 3. watch机制代码实现  
-list请求就是普通的http get请求，不管是服务端还是客户端的Go语言实现都非常简单，这里按下不表。具体看看watch请求的实现: 
+list请求就是普通的http get请求，不管是服务端还是客户端的Go语言实现都非常简单，这里按下不表。具体看看watch请求的底层具体实现: 
 
 - 服务端代码:
 
   ```
-  // 代码工程: kubernetes/apiserver
-  // 代码路径: pkg/endpoints/handlers/watch.go
+  // @kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
   func (s *WatchServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-    ...
+      ...
   	flusher, ok := w.(http.Flusher)  // 把ResponseWriter转换成Flusher
   	if !ok {
            ...
@@ -95,31 +98,34 @@ list请求就是普通的http get请求，不管是服务端还是客户端的Go
   	e := streaming.NewEncoder(framer, s.Encoder)
 
   	// ensure the connection times out
+  	// 超时时间: 优先使用客户端请求中的TimeoutSeconds值，如果请求中的TimeoutSeconds=0，则使用kube-apiserver的启动参数MinRequestTimeout值(默认为30min)
   	timeoutCh, cleanup := s.TimeoutFactory.TimeoutCh()
   	defer cleanup()
   	defer s.Watching.Stop()
 
   	// begin the stream
   	w.Header().Set("Content-Type", s.MediaType)
-  	w.Header().Set("Transfer-Encoding", "chunked")  // 设置header表示返回数据为http streaming方式
+  	// 在header中设置Transfer-Encoding=chunked,表示返回数据为http streaming方式
+  	w.Header().Set("Transfer-Encoding", "chunked")
   	w.WriteHeader(http.StatusOK)
   	flusher.Flush()
 
       ...
-  	ch := s.Watching.ResultChan()  // 获取从后端返回数据的管道
+  	ch := s.Watching.ResultChan()  // 获取从后端返回数据用的管道
   	for {
   		select {
+  		...
   		case <-timeoutCh:        // 服务端5min超时，长连接断开
   			return
-  		case event, ok := <-ch:  // 后端有返回数据时
+  		case event, ok := <-ch:  // 服务端有返回数据
   			if !ok {
   				// End of results.
   				return
   			}
 
-               ...
+              ...
   			if err := e.Encode(event); err != nil {  // 返回数据序列化处理(protobuffer)
-  				utilruntime.HandleError(fmt.Errorf("unable to encode watch object: %v (%#v)", err, e))
+  				...
   				// client disconnect.
   				return
   			}
@@ -134,17 +140,8 @@ list请求就是普通的http get请求，不管是服务端还是客户端的Go
 
 - 客户端代码:  
   ```
-  // 代码工程: kubernetes/apimachinery
-  // 代码路径: pkg/watch/streamwatcher.go
-
-  // StreamWatcher turns any stream for which you can write a Decoder interface
-  // into a watch.Interface.
-  type StreamWatcher struct {
-  	sync.Mutex
-  	source  Decoder
-  	result  chan Event
-  	stopped bool
-  }
+  - 底层http streaming处理代码如下：
+  // @kubernetes/staging/src/k8s.io/apimachinery/pkg/watch/streamwatcher.go
 
   // NewStreamWatcher creates a StreamWatcher from the given decoder.
   func NewStreamWatcher(d Decoder) *StreamWatcher {
@@ -170,14 +167,18 @@ list请求就是普通的http get请求，不管是服务端还是客户端的Go
   	defer sw.Stop()
   	defer utilruntime.HandleCrash()
   	for {
-  		action, obj, err := sw.source.Decode()  // 阻塞处理，当response.Body中有数据时函数返回
+  		// 阻塞处理，当response.Body中有数据时函数返回
+  		action, obj, err := sw.source.Decode()
   		if err != nil {
   			switch err {
-  			case io.EOF:   // 服务器端正常断开(如5min超时时间到)，客户端再次watch建立长连接即可
+  			// 服务器端正常断开(如超时时间到)，客户端再次watch建立长连接即可
+  			case io.EOF:
   				// watch closed normally
-  			case io.ErrUnexpectedEOF:  // 服务端出错，需要客户端relist同步数据
-  				glog.V(1).Infof("Unexpected EOF during watch stream event decoding: %v", err)
-  			default:  // 未知错误，需要客户端relist同步数据
+  			// 服务端出错，需要客户端再次list来同步数据
+  			case io.ErrUnexpectedEOF:
+  				...
+  			// 其他错误(如数据延迟过大)，也需要客户端再次list来同步数据
+  			default:
   				msg := "Unable to decode an event from the watch stream: %v"
   				if net.IsProbableEOF(err) {
   					glog.V(5).Infof(msg, err)
@@ -187,20 +188,26 @@ list请求就是普通的http get请求，不管是服务端还是客户端的Go
   			}
   			return  // 当有错误时，退出watch处理
   		}
-  		sw.result <- Event{  // 当成功获取到数据时，返回数据放入管道(注意是阻塞的)，然后继续循环等待新的数据
+  		// 当成功获取到数据时，返回数据放入管道(注意是阻塞的)，然后继续循环等待新的数据
+  		sw.result <- Event{
   			Type:   action,
   			Object: obj,
   		}
   	}
   }
+
+  - 调用http streaming的watch处理代码如下：
+  // kubernetes/vendor/k8s.io/client-go/rest/request.go
+  func (r *Request) Watch() (watch.Interface, error) {
+  	...
+  	return watch.NewStreamWatcher(restclientwatch.NewDecoder(decoder, r.serializers.Decoder)), nil
+  }
   ```
 
 ### 4. list-watch机制的几点考虑
-1. list请求是返回全量的数据，如果数据量较大时(比如20wPod)，如果watch失败后需要relist，这时候的list请求成本是很高的。(服务端和客户端都需要对20w数据进行编解码，序列化和反序列化等)。  
-2. watch请求采用http streaming方式，http1.1时(kubernetes1.5前)因为长连接是独立的TCP连接，假如网络断了，客户端是感知不到网络断开的，而只是以为服务端一直没有数据。而此时服务端可能产生了大量数据，因为网络断了无法通知到客户端。等网络恢复后，客户端可能因为数据差距过大，从而发生我们不愿意看到的relist请求。而在http/2时因为大家共用一条TCP连接，所以当很多请求无响应超过MRO时间后，系统会reset掉这条TCP连接再重建长连接，如果有热备机器的场景下，对集群的影响相对要小很多。  
-3. 在kubernetes1.5之前，网络闪断后，客户端的watch长连接只能通过tcp的keepalive机制检查到网络断开然后重新建立长连接。keepalive机制检查大约需要5min(go语言中默认transport的keepalive timeout时间为30s,即网络断开后一次keepalive检查需要30s，而检查次数由系统的/proc/sys/net/ipv4/tcp_keepalive_probe决定，默认为9，所以网络断开到检测出来需要耗时为: 30 * (9+1)=300s)  
-4. 同时kubernetes1.5之前http1.1中每个REST资源的list-watch都有一条长连接，这样对服务器压力很大。不过这个问题因为http/2的连接复用机制，在kubernetes1.5后得到了很好的解决。从这点考虑建议大家尽量使用kubernetes1.5以后的版本。    
+1. list请求是返回全量的数据，如果数据量较大时(比如20wPod)，如果watch失败后需要relist，这时候的list请求成本是很高的。(服务端和客户端都需要对20w数据进行编解码，序列化和反序列化等)。kubernetes大规模应用场景下，需要尽量减少relist发生次数。
+2. watch请求采用http streaming方式，http1.1时(kubernetes1.5前)因为长连接是独立的TCP连接，假如网络断了，客户端是感知不到网络断开的，而只是以为服务端一直没有数据。tcp keep-alive机制检测到网络断开后(golang默认http client的keep-alive时间是30s)，会主动rst掉该连接，然后再次建立新的连接。而在http/2(大于kubernetes1.5中使用)中因为大家共用一条TCP连接，客户端不断的各种请求导致keep-alive机制无法发挥作用，最后只能由数据的重传超时来reset掉这条TCP连接，这种场景下对系统的影响可能要大一些。  
+3. 同时kubernetes1.5之前http1.1中每个REST资源的list-watch都有一条长连接，这样对服务器压力很大。不过这个问题因为http/2的连接复用机制，在kubernetes1.5后得到了很好的解决。从这点考虑建议大家尽量使用kubernetes1.5以后的版本。    
 5. tcp长连接断开考虑: 因为watch请求是http streaming方式，客户端不清楚服务端是否还有数据需要发送，所以客户端一般不会主动关闭长连接。需要断开长连接时，应该考虑由服务端来断开。  
-6. 如果客户端挂掉后，服务端同样不知道，这样在kubernets1.5之前(因为使用http1.1)服务端维护大量的无效连接，造成服务端资源的大量浪费。kubernetes的解决方案是: watch请求中带一个超时参数(TimeoutSeconds)，默认为5min。所以服务端只要5min一到就会断开连接。为什么是5min并没有相关介绍，我的考虑是服务端断开连接，time_wait将砸在服务端的手里。而time_wait的有效时间为1min~4min，所以5min是一个比较好的选择，可以保证服务端的time_wait保持在一个比较稳定的数量。  
-7. kubernetes1.3之前组件通信主要采用http1.1+json的方式。当集群规模增大时，组件间通信数据的序列化和反序列化耗时明显增大，所以组件间通信数据的序列化协议逐步调整为protobuffer了。kubernetes1.7中已经全部为protobuffer了。  
-8. 消息的异步通知设计，是所有分布式系统面对的首要问题。kubernetes采用了上面我们介绍的list-watch机制。而在CloudFoundary系统中采用了消息组件nuts来解耦各个组件间的消息通知。另在mesos中采用tcp+protobuffer的机制实现slave和master之间的通信。  
+6. 如果客户端挂掉后，服务端同样不知道，这样在kubernets1.5之前(因为使用http1.1)服务端维护大量的无效连接，造成服务端资源的大量浪费。kubernetes的解决方案是: watch请求中带一个超时参数(TimeoutSeconds)，默认为5~10min间的随机数。所以服务端只要超时时间一到就会断开连接。为什么是5~10min并没有相关介绍，我的考虑是服务端断开连接，time_wait将砸在服务端的手里。而time_wait的有效时间为1min~4min，所以5~10min是一个比较好的选择，可以保证服务端的time_wait保持在一个比较稳定的数量。
+6. kubernetes1.3之前组件通信主要采用http1.1+json的方式。当集群规模增大时，组件间通信数据的序列化和反序列化耗时明显增大，所以组件间通信数据的序列化协议逐步调整为protobuffer了。kubernetes1.7中已经全部为protobuffer了。 
